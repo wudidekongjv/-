@@ -7,8 +7,10 @@
 发布本仓库后，推荐使用固定版本的 CDN 地址安装：
 
 ```text
-https://cdn.jsdelivr.net/gh/<你的 GitHub 用户>/<你的仓库>@v0.1.0/dist/director.js
+https://cdn.jsdelivr.net/gh/esncy/infinite-canvas-director-plugin@main/dist/director.js
 ```
+
+如需锁定稳定版本，可将 `@main` 换成已发布的版本标签，例如 `@v0.1.0`。
 
 安装后，画布创建菜单中会出现「3D 导演台」节点。把图片节点连到它，点击「打开导演台」即可使用；导演台截图会自动回传为画布图片节点。
 
