@@ -252,7 +252,7 @@ function DirectorContent({ ctx, React }) {
     };
     return h(
         "div",
-        { "data-canvas-no-zoom": true, onMouseDown: (event) => event.stopPropagation(), style: { display: "flex", height: "100%", width: "100%", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: 10, color: ctx.theme.node.text } },
+        { "data-canvas-no-zoom": true, style: { display: "flex", height: "100%", width: "100%", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: 10, color: ctx.theme.node.text } },
         h("div", { style: { fontSize: 34 } }, "🎬"),
         h("div", { style: { fontSize: 16, fontWeight: 600 } }, "3D 导演台"),
         h("div", { style: { color: ctx.theme.node.muted, fontSize: 12, textAlign: "center" } }, "连接上游图片，搭建场景并输出多视角截图"),
@@ -266,7 +266,7 @@ export default function createDirectorPlugin(runtime) {
     return {
         id: "director",
         name: "3D 导演台",
-        version: "0.1.0",
+        version: "0.1.1",
         minAppVersion: "0.12.0",
         description: "可独立安装的 3D 场景导演台节点,支持全景输入与多视角截图输出。",
         nodes: [
