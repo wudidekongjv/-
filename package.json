@@ -1,0 +1,14 @@
+{
+    "name": "infinite-canvas-director-plugin",
+    "version": "0.1.0",
+    "private": false,
+    "type": "module",
+    "description": "可独立安装的 Infinite Canvas 3D 导演台节点插件",
+    "scripts": {
+        "build": "node build.mjs",
+        "typecheck": "node --check src/index.js"
+    },
+    "devDependencies": {
+        "esbuild": "^0.25.0"
+    }
+}
