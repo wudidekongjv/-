@@ -551,7 +551,7 @@ export default function createVideoFramePlugin(runtime) {
     return {
         id: "video-frame",
         name: "视频拆帧",
-        version: "0.2.0",
+        version: "0.3.0",
         minAppVersion: "0.12.0",
         description: "从视频中拆分单帧或多帧（间隔拆分），带预览，可回传为画布图片节点。",
         nodes: [
