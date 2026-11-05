@@ -1,13 +1,51 @@
 // 视频拆帧节点插件 —— 独立安装，不依赖宿主源码或 React 包。
 // 只使用 Infinite Canvas 公开的工厂运行时契约（runtime.React / ctx.*）。
-// 拆帧引擎：<video> + <canvas>，零第三方依赖（与原插件一致）。
+//
+// 关键：视频节点的视频数据存在 metadata.content（远程 http/https URL），
+// 节点 type 为 "video"。浏览器 <video> 播放跨域视频时不能加 crossOrigin
+// （否则会因缺少 CORS 头而加载失败）；但要 drawImage 到 canvas 又需要 CORS。
+// 因此复刻宿主 captureVideoFrame 的策略：
+//   1) 先尝试直接抽帧（同源 / blob / CORS 允许时成功）；
+//   2) 失败则通过宿主代理 /api/proxy-image 下载成 blob，再本地抽帧。
 
-const MIME_TYPES = ["video/mp4", "video/webm", "video/ogg", "video/quicktime", "video/x-matroska", "video/*"];
+const MIME_TYPES = ["video/mp4", "video/webm", "video/ogg", "video/quicktime", "video/x-matroska"];
 const VIDEO_EXT_RE = /\.(mp4|webm|ogv|ogg|mov|m4v|mkv)$/i;
 
 function randomId(prefix) {
     if (typeof crypto?.randomUUID === "function") return `${prefix}-${crypto.randomUUID()}`;
     return `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+}
+
+// 复刻宿主 getProxyUrl 的核心逻辑（本地/内网地址不代理，其余走 /api/proxy-image）。
+function isLocalNetworkHost(hostname) {
+    const host = String(hostname || "").toLowerCase().replace(/^\[|\]$/g, "");
+    if (!host) return false;
+    if (
+        host === "localhost" ||
+        host.endsWith(".localhost") ||
+        host.endsWith(".local") ||
+        host === "host.docker.internal" ||
+        host === "::1"
+    ) {
+        return true;
+    }
+    const parts = host.split(".").map(Number);
+    if (parts.length !== 4 || parts.some((p) => !Number.isInteger(p) || p < 0 || p > 255)) return false;
+    const [a, b] = parts;
+    return a === 10 || a === 127 || (a === 172 && b >= 16 && b <= 31) || (a === 192 && b === 168) || (a === 169 && b === 254);
+}
+
+function getProxyUrl(url) {
+    if (typeof url !== "string" || (!url.startsWith("http://") && !url.startsWith("https://"))) return url;
+    try {
+        const parsed = new URL(url);
+        if (isLocalNetworkHost(parsed.hostname) || (typeof window !== "undefined" && parsed.host === window.location.host)) {
+            return url;
+        }
+    } catch {
+        return url;
+    }
+    return `/api/proxy-image?url=${encodeURIComponent(url)}`;
 }
 
 // 把任意时间格式（秒数 / "mm:ss" / "hh:mm:ss" / "mm:ss.mmm"）解析成秒。
@@ -39,21 +77,25 @@ function clamp(value, min, max) {
 }
 
 // 判断上游节点是否携带可用视频数据。
+// 视频节点 type === "video"，视频地址在 metadata.content（远程 URL / dataURL / blob URL）。
 function extractVideoSource(node) {
     if (!node) return null;
-    const content = node?.metadata?.content;
-    const mime = node?.metadata?.mimeType || node?.metadata?.type || "";
-    const looksLikeVideo =
-        (typeof content === "string" && content.startsWith("data:video/")) ||
-        (typeof content === "string" && content.startsWith("blob:") && MIME_TYPES.some((t) => mime.startsWith(t.split("/")[0]))) ||
-        MIME_TYPES.includes(mime) ||
-        (typeof node.title === "string" && VIDEO_EXT_RE.test(node.title));
-    if (!looksLikeVideo) return null;
-    return {
-        id: node.id,
-        src: typeof content === "string" && content ? content : null,
-        name: node.title || "视频",
-    };
+    if (node.type === "video" && typeof node.metadata?.content === "string" && node.metadata.content) {
+        return { id: node.id, src: node.metadata.content, name: node.title || "视频" };
+    }
+    // 兜底：其他类型节点若 content 是视频则也识别（兼容 dataURL/blob 直连）。
+    const content = node.metadata?.content;
+    const mime = node.metadata?.mimeType || "";
+    if (typeof content === "string" && content) {
+        const looksLikeVideo =
+            content.startsWith("data:video/") ||
+            (content.startsWith("blob:") && mime.startsWith("video/")) ||
+            MIME_TYPES.includes(mime) ||
+            VIDEO_EXT_RE.test(node.title || "") ||
+            /\.(mp4|webm|ogv|ogg|mov|m4v|mkv)(\?|#|$)/i.test(content);
+        if (looksLikeVideo) return { id: node.id, src: content, name: node.title || "视频" };
+    }
+    return null;
 }
 
 function buildVideoSources(ctx) {
@@ -64,29 +106,20 @@ function buildVideoSources(ctx) {
 // 从 <video> 的某个时间点抽出帧，返回 dataURL。
 function captureFrame(video, time, format, quality) {
     return new Promise((resolve, reject) => {
-        const videoEl = video;
         let finished = false;
-        const done = (result) => {
-            if (finished) return;
-            finished = true;
-            resolve(result);
-        };
-        const fail = (error) => {
-            if (finished) return;
-            finished = true;
-            reject(error);
-        };
+        const done = (result) => { if (finished) return; finished = true; resolve(result); };
+        const fail = (error) => { if (finished) return; finished = true; reject(error); };
 
         const onSeeked = () => {
             try {
-                const width = videoEl.videoWidth;
-                const height = videoEl.videoHeight;
+                const width = video.videoWidth;
+                const height = video.videoHeight;
                 if (!width || !height) return fail(new Error("无法读取视频画面尺寸"));
                 const canvas = document.createElement("canvas");
                 canvas.width = width;
                 canvas.height = height;
                 const context = canvas.getContext("2d");
-                context.drawImage(videoEl, 0, 0, width, height);
+                context.drawImage(video, 0, 0, width, height);
                 const dataUrl = canvas.toDataURL(format, quality);
                 done(dataUrl);
             } catch (error) {
@@ -94,44 +127,79 @@ function captureFrame(video, time, format, quality) {
             }
         };
 
-        videoEl.removeEventListener("seeked", onSeeked);
-        videoEl.addEventListener("seeked", onSeeked);
+        video.removeEventListener("seeked", onSeeked);
+        video.addEventListener("seeked", onSeeked);
+        const onError = () => fail(new Error("视频解码失败"));
+        video.addEventListener("error", onError);
         try {
-            videoEl.currentTime = time;
+            video.currentTime = time;
         } catch (error) {
             fail(error);
         }
-        // 兜底：2 秒内未触发 seeked 则失败。
-        setTimeout(() => fail(new Error("抽帧超时")), 2000);
+        setTimeout(() => fail(new Error("抽帧超时")), 4000);
     });
 }
 
-// 从视频文件（dataURL / blob URL）加载出可用的 <video>。
+// 从某个源加载出可用的 <video>。不加 crossOrigin（否则跨域远程视频会因缺 CORS 头加载失败）。
 function loadVideo(src) {
     return new Promise((resolve, reject) => {
         const video = document.createElement("video");
         video.preload = "auto";
         video.muted = true;
         video.playsInline = true;
-        video.crossOrigin = "anonymous";
         let settled = false;
-        const fail = (error) => {
-            if (settled) return;
-            settled = true;
-            reject(error);
-        };
-        const onLoaded = () => {
-            if (settled) return;
-            settled = true;
-            resolve(video);
-        };
+        const fail = (error) => { if (settled) return; settled = true; reject(error); };
+        const onLoaded = () => { if (settled) return; settled = true; resolve(video); };
         video.addEventListener("loadedmetadata", onLoaded);
-        video.addEventListener("error", () => fail(new Error("视频加载失败，可能是浏览器不支持的编码格式")));
+        video.addEventListener("error", () => fail(new Error("视频加载失败")));
         video.src = src;
+        video.load();
     });
 }
 
-// 输出帧图片的原始尺寸（用于回传时计算节点尺寸）。
+// 通过宿主代理下载远程媒体为 blob（复刻 downloadRemoteMedia 策略）。
+async function downloadRemoteMedia(url) {
+    const response = await fetch(getProxyUrl(url), { cache: "no-store" });
+    if (!response.ok) throw new Error(`媒体下载失败 (${response.status})`);
+    const blob = await response.blob();
+    if (blob.type.includes("json") || blob.type.startsWith("text/")) {
+        const text = await blob.text().catch(() => "");
+        let message = "";
+        try { message = JSON.parse(text)?.msg || JSON.parse(text)?.message || ""; } catch { /* ignore */ }
+        throw new Error(message || "代理下载失败");
+    }
+    return blob;
+}
+
+// 抽帧（复刻宿主 captureVideoFrame：直连失败则走代理下载）。
+async function captureFrameFromSource(source, time, format, quality) {
+    try {
+        const video = await loadVideo(source);
+        try {
+            return await captureFrame(video, time, format, quality);
+        } finally {
+            video.removeAttribute("src");
+            video.load();
+        }
+    } catch (error) {
+        if (typeof source !== "string" || !source.startsWith("http")) throw error;
+        // 跨域视频无法直接 canvas 抽帧 → 走代理下载成 blob 再抽。
+        const localUrl = URL.createObjectURL(await downloadRemoteMedia(source));
+        try {
+            const video = await loadVideo(localUrl);
+            try {
+                return await captureFrame(video, time, format, quality);
+            } finally {
+                video.removeAttribute("src");
+                video.load();
+            }
+        } finally {
+            URL.revokeObjectURL(localUrl);
+        }
+    }
+}
+
+// 输出帧图片的原始尺寸。
 function imageSize(dataUrl) {
     return new Promise((resolve) => {
         const image = new Image();
@@ -148,7 +216,6 @@ function fitImageSize(width, height) {
     return { width: Math.max(160, Math.round(width * scale)), height: Math.max(120, Math.round(height * scale)) };
 }
 
-// 把一批帧回传为画布图片节点并连线到本节点。
 async function sendFrames(ctx, frames) {
     if (!frames.length) return;
     const node = ctx.node;
@@ -193,7 +260,7 @@ function VideoFrameContent({ ctx, React }) {
     const [duration, setDuration] = React.useState(0);
     const [videoEl, setVideoEl] = React.useState(null);
 
-    const [mode, setMode] = React.useState("single"); // "single" | "range"
+    const [mode, setMode] = React.useState("single");
     const [singleTime, setSingleTime] = React.useState("0");
     const [rangeStart, setRangeStart] = React.useState("0");
     const [rangeEnd, setRangeEnd] = React.useState("");
@@ -201,7 +268,7 @@ function VideoFrameContent({ ctx, React }) {
     const [format, setFormat] = React.useState("image/jpeg");
     const [quality, setQuality] = React.useState(0.92);
 
-    const [previews, setPreviews] = React.useState([]); // { time, dataUrl, key }
+    const [previews, setPreviews] = React.useState([]);
     const [busy, setBusy] = React.useState(false);
     const [status, setStatus] = React.useState("");
 
@@ -231,13 +298,6 @@ function VideoFrameContent({ ctx, React }) {
         })();
     }, [JSON.stringify(buildVideoSources(ctxRef.current).map((s) => s.id))]);
 
-    // 让 <video> 元素挂到 ref 上（预览播放器复用）。
-    React.useEffect(() => {
-        if (videoRef.current && videoEl) {
-            // 复用同一 video 元素做播放预览与抽帧。
-        }
-    }, [videoEl]);
-
     const handleFile = (event) => {
         const file = event.target?.files?.[0];
         if (!file) return;
@@ -263,24 +323,18 @@ function VideoFrameContent({ ctx, React }) {
         try {
             videoEl.currentTime = clamp(time, 0, duration || 0);
             videoEl.pause();
-        } catch (_error) {
-            /* 忽略 */
-        }
+        } catch (_error) { /* ignore */ }
     };
 
-    // 预览单帧。
     const previewSingle = async () => {
-        if (!videoEl) {
-            setStatus("请先导入或连接视频");
-            return;
-        }
+        if (!videoSrc) { setStatus("请先导入或连接视频"); return; }
         setBusy(true);
         setStatus("");
         try {
             const time = clamp(parseTimeToSeconds(singleTime), 0, duration || 0);
             if (Number.isNaN(time)) throw new Error("时间格式无效");
-            const dataUrl = await captureFrame(videoEl, time, format, quality);
-            setPreviews([{ key: randomId("preview"), time, dataUrl, fileName: `${videoName.replace(/\.[^.]+$/, "") || "拆帧"}-${time.toFixed(2)}s.jpg` }]);
+            const dataUrl = await captureFrameFromSource(videoSrc, time, format, quality);
+            setPreviews([{ key: randomId("preview"), time, dataUrl, fileName: `${(videoName.replace(/\.[^.]+$/, "") || "拆帧")}-${time.toFixed(2)}s.jpg` }]);
             seekPreview(time);
         } catch (error) {
             setStatus(`拆帧失败：${error instanceof Error ? error.message : String(error)}`);
@@ -289,41 +343,24 @@ function VideoFrameContent({ ctx, React }) {
         }
     };
 
-    // 间隔拆分多帧。
     const previewRange = async () => {
-        if (!videoEl) {
-            setStatus("请先导入或连接视频");
-            return;
-        }
+        if (!videoSrc) { setStatus("请先导入或连接视频"); return; }
         const start = parseTimeToSeconds(rangeStart);
         const end = parseTimeToSeconds(rangeEnd || String(duration || 0));
         const step = parseTimeToSeconds(interval);
-        if (Number.isNaN(start) || Number.isNaN(end) || Number.isNaN(step)) {
-            setStatus("起止时间或间隔格式无效");
-            return;
-        }
-        if (step <= 0) {
-            setStatus("间隔必须大于 0");
-            return;
-        }
-        if (end <= start) {
-            setStatus("结束时间必须大于开始时间");
-            return;
-        }
+        if (Number.isNaN(start) || Number.isNaN(end) || Number.isNaN(step)) { setStatus("起止时间或间隔格式无效"); return; }
+        if (step <= 0) { setStatus("间隔必须大于 0"); return; }
+        if (end <= start) { setStatus("结束时间必须大于开始时间"); return; }
         setBusy(true);
         setStatus("");
         try {
             const times = [];
             for (let t = start; t <= end + 1e-6; t += step) times.push(Math.round(t * 1000) / 1000);
-            if (times.length > 120) {
-                setStatus("单次最多拆 120 帧，请增大间隔");
-                setBusy(false);
-                return;
-            }
+            if (times.length > 120) { setStatus("单次最多拆 120 帧，请增大间隔"); setBusy(false); return; }
             const results = [];
             for (const time of times) {
-                const dataUrl = await captureFrame(videoEl, time, format, quality);
-                results.push({ key: randomId("preview"), time, dataUrl, fileName: `${videoName.replace(/\.[^.]+$/, "") || "拆帧"}-${time.toFixed(2)}s.jpg` });
+                const dataUrl = await captureFrameFromSource(videoSrc, time, format, quality);
+                results.push({ key: randomId("preview"), time, dataUrl, fileName: `${(videoName.replace(/\.[^.]+$/, "") || "拆帧")}-${time.toFixed(2)}s.jpg` });
             }
             setPreviews(results);
         } catch (error) {
@@ -336,10 +373,7 @@ function VideoFrameContent({ ctx, React }) {
     const clearPreviews = () => setPreviews([]);
 
     const exportFrames = async () => {
-        if (!previews.length) {
-            setStatus("没有可回传的帧，请先拆帧");
-            return;
-        }
+        if (!previews.length) { setStatus("没有可回传的帧，请先拆帧"); return; }
         setBusy(true);
         try {
             await sendFrames(ctxRef.current, previews);
@@ -378,25 +412,19 @@ function VideoFrameContent({ ctx, React }) {
     const primaryStyle = { ...buttonStyle, background: ctx.theme.accent || "#4c8dff", color: "#fff", fontWeight: 600 };
 
     const modeButton = (value, label) =>
-        h(
-            "button",
-            {
-                type: "button",
-                style: { ...buttonStyle, flex: 1, background: mode === value ? (ctx.theme.accent || "#4c8dff") : ctx.theme.toolbar.itemHover, color: mode === value ? "#fff" : text },
-                onClick: () => setMode(value),
-            },
-            label,
-        );
+        h("button", {
+            type: "button",
+            style: { ...buttonStyle, flex: 1, background: mode === value ? (ctx.theme.accent || "#4c8dff") : ctx.theme.toolbar.itemHover, color: mode === value ? "#fff" : text },
+            onClick: () => setMode(value),
+        }, label);
 
     return h(
         "div",
         { "data-canvas-no-zoom": true, style: { display: "flex", flexDirection: "column", gap: 10, padding: 12, width: "100%", height: "100%", boxSizing: "border-box", overflowY: "auto", color: text, fontSize: 12 } },
-        // 标题
         h("div", { style: { display: "flex", alignItems: "center", gap: 8 } },
             h("span", { style: { fontSize: 18 } }, "🎞️"),
             h("span", { style: { fontSize: 14, fontWeight: 600 } }, "视频拆帧"),
         ),
-        // 导入视频
         h("div", null,
             h("div", { style: labelStyle }, "视频源"),
             h("input", { ref: fileInputRef, type: "file", accept: "video/*", style: { display: "none" }, onChange: handleFile }),
@@ -405,27 +433,21 @@ function VideoFrameContent({ ctx, React }) {
                 videoSrc ? h("span", { style: { fontSize: 11, color: muted, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" } }, videoName || "已加载") : h("span", { style: { fontSize: 11, color: muted } }, "也可连接上游视频节点"),
             ),
         ),
-        // 预览播放器
         videoSrc
-            ? h(
-                "video",
-                {
-                    ref: videoRef,
-                    src: videoSrc,
-                    controls: true,
-                    muted: true,
-                    playsInline: true,
-                    style: { width: "100%", maxHeight: 180, borderRadius: 8, background: "#000" },
-                    onLoadedMetadata: (event) => { setDuration(event.target.duration || 0); setRangeEnd(String(Math.round((event.target.duration || 0) * 100) / 100)); },
-                },
-            )
+            ? h("video", {
+                ref: videoRef,
+                src: videoSrc,
+                controls: true,
+                muted: true,
+                playsInline: true,
+                style: { width: "100%", maxHeight: 180, borderRadius: 8, background: "#000" },
+                onLoadedMetadata: (event) => { setDuration(event.target.duration || 0); setRangeEnd(String(Math.round((event.target.duration || 0) * 100) / 100)); },
+            })
             : null,
-        // 模式切换
         h("div", { style: { display: "flex", gap: 6 } },
             modeButton("single", "拆单帧"),
             modeButton("range", "间隔拆帧"),
         ),
-        // 单帧参数
         mode === "single"
             ? h("div", null,
                 h("div", { style: labelStyle }, `单帧时间（当前 ${duration ? `0:00 - ${formatTime(duration)}` : "未知时长"}）`),
@@ -445,7 +467,6 @@ function VideoFrameContent({ ctx, React }) {
                     h("button", { type: "button", style: primaryStyle, onClick: previewRange, disabled: busy }, busy ? "拆帧中…" : "拆分多帧"),
                 ),
             ),
-        // 格式与质量
         h("div", { style: { display: "flex", gap: 8, alignItems: "center" } },
             h("select", { value: format, style: { ...inputStyle, width: "auto" }, onChange: (e) => setFormat(e.target.value) },
                 h("option", { value: "image/jpeg" }, "JPG"),
@@ -455,7 +476,6 @@ function VideoFrameContent({ ctx, React }) {
             h("span", { style: { fontSize: 11, color: muted } }, "质量"),
             h("input", { type: "range", min: 0.5, max: 1, step: 0.01, value: quality, style: { flex: 1 }, onChange: (e) => setQuality(Number(e.target.value)) }),
         ),
-        // 预览画廊
         previews.length
             ? h("div", null,
                 h("div", { style: { display: "flex", justifyContent: "space-between", alignItems: "center" } },
@@ -482,7 +502,7 @@ export default function createVideoFramePlugin(runtime) {
     return {
         id: "video-frame",
         name: "视频拆帧",
-        version: "0.1.0",
+        version: "0.2.0",
         minAppVersion: "0.12.0",
         description: "从视频中拆分单帧或多帧（间隔拆分），带预览，可回传为画布图片节点。",
         nodes: [
