@@ -1,6 +1,6 @@
-# 视频拆帧节点插件
+# Infinite Canvas 视频拆帧节点插件
 
-一个可独立安装的 Infinite Canvas 第三方节点插件，用于从视频中拆分出单帧或多帧静态图片，并回传到画布作为图片节点。
+这是 [Infinite Canvas（无限画布）](https://github.com/tigerowo/infinite-canvas) 的一个第三方节点插件，用于从视频中拆分出单帧或多帧静态图片，并回传到画布作为图片节点。
 
 ## 功能
 
