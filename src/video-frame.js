@@ -103,6 +103,44 @@ function buildVideoSources(ctx) {
     return upstream.map(extractVideoSource).filter(Boolean);
 }
 
+// 把视频源地址解析成「浏览器可真正加载」的地址。
+// 复刻宿主 hushifu-bridge 的 yye / remoteToDataUrl 逻辑：
+//   - dataURL / blob URL → 原样返回
+//   - https://canvas-assets/xxx → 走 window.hushifuHost.materialDataUrl(文件名) 拿 dataURL
+//     （canvas-assets 是 DenyCors 虚拟主机，页面 fetch/<video> 都加载不到，必须走宿主 postMessage 通道）
+//   - 其他远程 http/https URL → fetch 下载成 blob 再转本地 blob URL
+async function resolveVideoSource(src) {
+    const value = String(src || "");
+    if (!value) return null;
+    if (value.startsWith("data:") || value.startsWith("blob:")) return value;
+
+    const host = (typeof window !== "undefined" && window.hushifuHost) || null;
+    const canvasAsset = value.match(/^https:\/\/canvas-assets\/([^/?#]+)/i);
+    if (canvasAsset && host && typeof host.materialDataUrl === "function") {
+        try {
+            const dataUrl = await host.materialDataUrl(canvasAsset[1]);
+            if (typeof dataUrl === "string" && dataUrl.startsWith("data:")) return dataUrl;
+        } catch (_error) {
+            // 拿不到就走下面的普通 fetch 兜底（大概率也失败，但至少给个明确错误）。
+        }
+        throw new Error("无法从宿主读取该视频素材（canvas-assets 通道失败）");
+    }
+
+    if (value.startsWith("http://") || value.startsWith("https://")) {
+        try {
+            const response = await fetch(value, { cache: "no-store" });
+            if (!response.ok) throw new Error(`HTTP ${response.status}`);
+            const blob = await response.blob();
+            if (blob.type.includes("json") || blob.type.startsWith("text/")) throw new Error("远程地址返回的不是视频");
+            return URL.createObjectURL(blob);
+        } catch (error) {
+            throw new Error(`视频下载失败：${error instanceof Error ? error.message : String(error)}`);
+        }
+    }
+
+    return value;
+}
+
 // 从 <video> 的某个时间点抽出帧，返回 dataURL。
 function captureFrame(video, time, format, quality) {
     return new Promise((resolve, reject) => {
@@ -171,10 +209,16 @@ async function downloadRemoteMedia(url) {
     return blob;
 }
 
-// 抽帧（复刻宿主 captureVideoFrame：直连失败则走代理下载）。
+// 抽帧（先解析视频源地址，再加载抽帧；canvas-assets 虚拟地址会走宿主通道转 dataURL）。
 async function captureFrameFromSource(source, time, format, quality) {
+    // 1) 先解析出浏览器真正能加载的地址（canvas-assets → dataURL / 远程 → blob URL）。
+    const resolved = await resolveVideoSource(source);
+    if (!resolved) throw new Error("视频源地址为空");
+
+    // 2) 加载并抽帧。
+    const localUrl = resolved.startsWith("data:") || resolved.startsWith("blob:") ? resolved : null;
     try {
-        const video = await loadVideo(source);
+        const video = await loadVideo(resolved);
         try {
             return await captureFrame(video, time, format, quality);
         } finally {
@@ -182,11 +226,11 @@ async function captureFrameFromSource(source, time, format, quality) {
             video.load();
         }
     } catch (error) {
-        if (typeof source !== "string" || !source.startsWith("http")) throw error;
-        // 跨域视频无法直接 canvas 抽帧 → 走代理下载成 blob 再抽。
-        const localUrl = URL.createObjectURL(await downloadRemoteMedia(source));
+        // 3) 兜底：如果直连失败（跨域/CORS），尝试下载成 blob 再抽。
+        if (localUrl) throw error;
+        const blobUrl = URL.createObjectURL(await downloadRemoteMedia(resolved));
         try {
-            const video = await loadVideo(localUrl);
+            const video = await loadVideo(blobUrl);
             try {
                 return await captureFrame(video, time, format, quality);
             } finally {
@@ -194,7 +238,7 @@ async function captureFrameFromSource(source, time, format, quality) {
                 video.load();
             }
         } finally {
-            URL.revokeObjectURL(localUrl);
+            URL.revokeObjectURL(blobUrl);
         }
     }
 }
@@ -256,6 +300,7 @@ function VideoFrameContent({ ctx, React }) {
     const h = React.createElement;
 
     const [videoSrc, setVideoSrc] = React.useState(null);
+    const [resolvedSrc, setResolvedSrc] = React.useState(null);
     const [videoName, setVideoName] = React.useState("");
     const [duration, setDuration] = React.useState(0);
     const [videoEl, setVideoEl] = React.useState(null);
@@ -285,9 +330,12 @@ function VideoFrameContent({ ctx, React }) {
         if (!first.src) return;
         void (async () => {
             try {
-                const video = await loadVideo(first.src);
+                const resolved = await resolveVideoSource(first.src);
+                if (!resolved) throw new Error("视频源地址为空");
+                const video = await loadVideo(resolved);
                 setVideoEl(video);
                 setVideoSrc(first.src);
+                setResolvedSrc(resolved);
                 setVideoName(first.name);
                 setDuration(video.duration || 0);
                 setRangeEnd(String(Math.round((video.duration || 0) * 100) / 100));
@@ -307,6 +355,7 @@ function VideoFrameContent({ ctx, React }) {
                 const video = await loadVideo(url);
                 setVideoEl(video);
                 setVideoSrc(url);
+                setResolvedSrc(url);
                 setVideoName(file.name || "导入视频");
                 setDuration(video.duration || 0);
                 setRangeEnd(String(Math.round((video.duration || 0) * 100) / 100));
@@ -436,7 +485,7 @@ function VideoFrameContent({ ctx, React }) {
         videoSrc
             ? h("video", {
                 ref: videoRef,
-                src: videoSrc,
+                src: resolvedSrc || videoSrc,
                 controls: true,
                 muted: true,
                 playsInline: true,
